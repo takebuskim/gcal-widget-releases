@@ -1,0 +1,80 @@
+name: Prune Old Releases
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Keep at most 15 latest releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          KEEP_COUNT: "15"
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          token = os.environ["GH_TOKEN"]
+          repo = os.environ["REPO"]
+          keep = int(os.environ["KEEP_COUNT"])
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "User-Agent": "prune-old-releases-action",
+          }
+
+          releases = []
+          page = 1
+          while True:
+              url = f"https://api.github.com/repos/{repo}/releases?per_page=100&page={page}"
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req) as resp:
+                  batch = json.loads(resp.read().decode("utf-8"))
+              if not batch:
+                  break
+              releases.extend(r for r in batch if not r.get("draft"))
+              if len(batch) < 100:
+                  break
+              page += 1
+
+          releases.sort(key=lambda r: (r.get("published_at") or r.get("created_at") or "", r["id"]))
+          excess = len(releases) - keep
+          print(f"Total published releases: {len(releases)}, keep: {keep}, to delete: {max(0, excess)}")
+
+          if excess <= 0:
+              raise SystemExit(0)
+
+          for rel in releases[:excess]:
+              rel_id = rel["id"]
+              tag = rel.get("tag_name")
+              print(f"Deleting oldest release {tag} (id={rel_id}, published_at={rel.get('published_at')})")
+              del_rel = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/releases/{rel_id}",
+                  headers=headers,
+                  method="DELETE",
+              )
+              urllib.request.urlopen(del_rel).read()
+
+              if tag:
+                  encoded_tag = urllib.parse.quote(tag, safe="")
+                  try:
+                      del_tag = urllib.request.Request(
+                          f"https://api.github.com/repos/{repo}/git/refs/tags/{encoded_tag}",
+                          headers=headers,
+                          method="DELETE",
+                      )
+                      urllib.request.urlopen(del_tag).read()
+                      print(f"Deleted tag refs/tags/{tag}")
+                  except Exception as e:
+                      print(f"Tag cleanup skipped for {tag}: {e}")
+          PY
